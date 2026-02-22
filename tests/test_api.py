@@ -1,11 +1,14 @@
 """API 端点集成测试。
 
-注意: 由于 SQLite 不支持 PostgreSQL 特有的 JSONB 和 ARRAY 类型，
-这些测试需要 PostgreSQL 数据库。SQLite fixture 仅用于路由注册验证。
+核心档案 API 需要 PostgreSQL。
+MongoDB 相关 API 使用 mock。
 
 运行方式:
     DATABASE_URL=postgresql+asyncpg://... pytest tests/test_api.py
 """
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -17,7 +20,7 @@ from app.main import app
 
 _is_postgres = "postgresql" in settings.DATABASE_URL
 
-pytestmark = pytest.mark.skipif(
+pytestmark_postgres = pytest.mark.skipif(
     not _is_postgres,
     reason="需要 PostgreSQL 数据库 (设置 DATABASE_URL 环境变量)",
 )
@@ -71,11 +74,15 @@ class TestHealthCheck:
         ) as ac:
             resp = await ac.get("/health")
         assert resp.status_code == 200
-        assert resp.json()["status"] == "ok"
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["version"] == "0.2.0"
 
 
 class TestProfileAPI:
     """核心档案 API 测试。"""
+
+    pytestmark = pytestmark_postgres
 
     @pytest.mark.asyncio
     async def test_get_profile_creates_empty(self, pg_client):
@@ -89,13 +96,11 @@ class TestProfileAPI:
 
     @pytest.mark.asyncio
     async def test_update_profile(self, pg_client):
-        # 先创建
         await pg_client.get(
             "/api/v1/memory/profile",
             headers={"X-User-Id": "1"},
         )
 
-        # 更新
         resp = await pg_client.put(
             "/api/v1/memory/profile",
             headers={"X-User-Id": "1"},
@@ -111,96 +116,80 @@ class TestProfileAPI:
         assert data["core_goals"] == ["提升领导力"]
 
 
-class TestManualMemoryAPI:
-    """手动记忆 API 测试。"""
+class TestDailyMemoryAPI:
+    """每日记忆 API 测试（Mock MongoDB）。"""
 
     @pytest.mark.asyncio
-    async def test_create_memory(self, pg_client):
-        resp = await pg_client.post(
-            "/api/v1/memory/manual",
-            headers={"X-User-Id": "1"},
-            json={
-                "content": "每周五下午接女儿放学",
-                "memory_type": "event",
-                "importance_score": 8,
-            },
-        )
-        assert resp.status_code == 201
-        data = resp.json()
-        assert data["content"] == "每周五下午接女儿放学"
-        assert data["memory_type"] == "event"
+    async def test_get_daily_memory_empty(self):
+        with patch("app.routers.memory.memory_service") as mock_service:
+            mock_service.get_daily_memory = AsyncMock(return_value=None)
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as ac:
+                resp = await ac.get(
+                    "/api/v1/memory/daily?date=2026-02-22",
+                    headers={"X-User-Id": "1"},
+                )
+
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["user_id"] == 1
+            assert data["date"] == "2026-02-22"
+            assert data["items"] == []
 
     @pytest.mark.asyncio
-    async def test_get_recent_memories(self, pg_client):
-        # 创建几条记忆
-        for i in range(3):
-            await pg_client.post(
-                "/api/v1/memory/manual",
-                headers={"X-User-Id": "1"},
-                json={"content": f"记忆 {i}"},
-            )
+    async def test_get_recent_daily_memories(self):
+        with patch("app.routers.memory.memory_service") as mock_service:
+            mock_service.get_recent_daily_memories = AsyncMock(return_value=[])
 
-        resp = await pg_client.get(
-            "/api/v1/memory/manual/recent?limit=10",
-            headers={"X-User-Id": "1"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) == 3
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as ac:
+                resp = await ac.get(
+                    "/api/v1/memory/daily/recent?days=7",
+                    headers={"X-User-Id": "1"},
+                )
 
-    @pytest.mark.asyncio
-    async def test_delete_memory(self, pg_client):
-        # 创建
-        create_resp = await pg_client.post(
-            "/api/v1/memory/manual",
-            headers={"X-User-Id": "1"},
-            json={"content": "要删除的记忆"},
-        )
-        memory_id = create_resp.json()["id"]
+            assert resp.status_code == 200
+            assert resp.json() == []
 
-        # 删除
-        resp = await pg_client.delete(
-            f"/api/v1/memory/manual/{memory_id}",
-            headers={"X-User-Id": "1"},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["success"] is True
+
+class TestInternalAPI:
+    """内部 API 测试（Mock）。"""
 
     @pytest.mark.asyncio
-    async def test_delete_nonexistent_returns_404(self, pg_client):
-        resp = await pg_client.delete(
-            "/api/v1/memory/manual/99999",
-            headers={"X-User-Id": "1"},
-        )
-        assert resp.status_code == 404
+    async def test_extract_memories(self):
+        from app.models.memory import MemoryCategory, MemoryItem
 
-    @pytest.mark.asyncio
-    async def test_create_memory_validation(self, pg_client):
-        # 空内容应该返回 422
-        resp = await pg_client.post(
-            "/api/v1/memory/manual",
-            headers={"X-User-Id": "1"},
-            json={"content": ""},
-        )
-        assert resp.status_code == 422
+        mock_items = [
+            MemoryItem(
+                category=MemoryCategory.PREFERENCE,
+                content="喜欢跑步",
+                importance=6,
+            ),
+        ]
 
-        # importance_score 超范围应该返回 422
-        resp = await pg_client.post(
-            "/api/v1/memory/manual",
-            headers={"X-User-Id": "1"},
-            json={"content": "test", "importance_score": 11},
-        )
-        assert resp.status_code == 422
+        with patch("app.routers.memory.memory_service") as mock_service:
+            mock_service.extract_and_store = AsyncMock(return_value=mock_items)
 
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as ac:
+                resp = await ac.post(
+                    "/api/v1/memory/internal/extract",
+                    json={
+                        "user_id": 1,
+                        "messages": [
+                            {"role": "user", "content": "我喜欢跑步"},
+                        ],
+                    },
+                )
 
-class TestContextAPI:
-    """记忆上下文 API 测试。"""
-
-    @pytest.mark.asyncio
-    async def test_get_context(self, pg_client):
-        resp = await pg_client.get("/api/v1/memory/context?user_id=1")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "formatted_prompt" in data
-        assert "core_profile" in data
-        assert "recent_memories" in data
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["extracted_count"] == 1
+            assert data["items"][0]["content"] == "喜欢跑步"

@@ -1,13 +1,13 @@
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 
+from pydantic import BaseModel, Field
 from sqlalchemy import (
     ARRAY,
-    CheckConstraint,
     DateTime,
     Index,
     Integer,
     String,
-    Text,
     UniqueConstraint,
     func,
 )
@@ -15,6 +15,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+
+
+# ── PostgreSQL ORM 模型 ──────────────────────────────────
 
 
 class UserProfile(Base):
@@ -73,61 +76,65 @@ class UserProfile(Base):
     version: Mapped[int] = mapped_column(Integer, server_default="1")
 
 
-class ManualMemory(Base):
-    """手动记忆模型。
+# ── MongoDB 文档模型 ─────────────────────────────────────
 
-    存储用户通过 "楷，请记住..." 等指令主动告知的信息，
-    按重要性评分排序后注入 AI 对话上下文。
+
+class MemoryCategory(str, Enum):
+    """记忆分类枚举。"""
+
+    PREFERENCE = "preference"
+    GOAL = "goal"
+    HEALTH = "health"
+    EVENT = "event"
+    RELATIONSHIP = "relationship"
+    EMOTION = "emotion"
+    INSIGHT = "insight"
+    GENERAL = "general"
+
+
+class MemoryItem(BaseModel):
+    """单条记忆项（嵌入在 DailyMemory 中）。"""
+
+    category: MemoryCategory = MemoryCategory.GENERAL
+    content: str
+    importance: int = Field(default=5, ge=1, le=10)
+    source_role: str = Field(default="user", description="消息来源: user 或 assistant")
+    extracted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class DailyMemory(BaseModel):
+    """每日记忆文档模型（MongoDB: daily_memories 集合）。
+
+    每个用户每天一份文档，包含当天从对话中提取的所有记忆项。
     """
 
-    __tablename__ = "manual_memories"
-    __table_args__ = (
-        CheckConstraint(
-            "importance_score BETWEEN 1 AND 10",
-            name="check_importance_score",
-        ),
-        Index("idx_manual_memories_user_id", "user_id"),
-        Index("idx_manual_memories_status", "status"),
-        Index("idx_manual_memories_created_at", "created_at", postgresql_using="btree"),
-        Index(
-            "idx_manual_memories_importance",
-            "importance_score",
-            postgresql_using="btree",
-        ),
+    user_id: int
+    date: str = Field(description="日期字符串 YYYY-MM-DD")
+    items: list[MemoryItem] = Field(default_factory=list)
+    summary: str | None = Field(
+        default=None, description="当天记忆摘要（每晚生成）"
     )
+    conversation_count: int = Field(default=0, description="当天对话轮数")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # 记忆内容
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+class LongTermMemory(BaseModel):
+    """长期记忆文档模型（MongoDB: long_term_memories 集合）。
 
-    # 记忆类型: general, preference, goal, health, event, relationship
-    memory_type: Mapped[str] = mapped_column(
-        String(50), server_default="'general'"
+    对 DailyMemory 的周/月级别汇总，保留关键模式和变化趋势。
+    """
+
+    user_id: int
+    period_type: str = Field(description="周期类型: weekly 或 monthly")
+    period_start: str = Field(description="周期起始日期 YYYY-MM-DD")
+    period_end: str = Field(description="周期结束日期 YYYY-MM-DD")
+    summary: str = Field(description="周期总结")
+    key_themes: list[str] = Field(default_factory=list, description="关键主题")
+    notable_changes: list[str] = Field(
+        default_factory=list, description="显著变化"
     )
-
-    # 重要性评分 1-10
-    importance_score: Mapped[int] = mapped_column(Integer, server_default="5")
-
-    # 来源
-    source: Mapped[str] = mapped_column(
-        String(100), server_default="'user_instruction'"
+    emotional_trend: str | None = Field(
+        default=None, description="情绪趋势描述"
     )
-    source_message_id: Mapped[str | None] = mapped_column(String(100))
-
-    # 状态: active, archived, deleted
-    status: Mapped[str] = mapped_column(String(20), server_default="'active'")
-
-    # 元数据
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    access_count: Mapped[int] = mapped_column(Integer, server_default="0")
-
-    # 过期时间
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

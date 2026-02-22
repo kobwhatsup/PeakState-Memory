@@ -1,25 +1,29 @@
 """MemoryService 单元测试。
 
-注意: 这些测试需要 PostgreSQL 数据库支持（因为使用了 JSONB 和 ARRAY 类型）。
-使用 SQLite 时 JSONB/ARRAY 不可用，此文件中的测试标记为需要 postgres。
+核心档案测试需要 PostgreSQL 数据库支持（JSONB 和 ARRAY 类型）。
+MongoDB 相关测试使用 mock 对象。
 
 运行方式:
     DATABASE_URL_SYNC=postgresql://... pytest tests/test_memory_service.py
 """
+
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
 from app.database import Base
-from app.schemas.memory import ManualMemoryCreate, UserProfileCreate, UserProfileUpdate
+from app.models.memory import DailyMemory, MemoryCategory, MemoryItem
+from app.schemas.memory import UserProfileCreate, UserProfileUpdate
 from app.services.memory_service import MemoryService
 
 # 检测是否配置了 PostgreSQL
 _is_postgres = "postgresql" in settings.DATABASE_URL
 
-pytestmark = pytest.mark.skipif(
+pytestmark_postgres = pytest.mark.skipif(
     not _is_postgres,
     reason="需要 PostgreSQL 数据库 (设置 DATABASE_URL 环境变量)",
 )
@@ -40,7 +44,6 @@ async def pg_session():
     async with session_factory() as session:
         yield session
 
-    # 清理
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
 
@@ -53,7 +56,9 @@ def service():
 
 
 class TestUserProfile:
-    """核心档案 CRUD 测试。"""
+    """核心档案 CRUD 测试（PostgreSQL）。"""
+
+    pytestmark = pytestmark_postgres
 
     @pytest.mark.asyncio
     async def test_create_and_get_profile(self, pg_session, service):
@@ -91,116 +96,141 @@ class TestUserProfile:
 
     @pytest.mark.asyncio
     async def test_get_or_create_profile(self, pg_session, service):
-        # 不存在时自动创建
         profile = await service.get_or_create_profile(pg_session, user_id=99)
         await pg_session.commit()
         assert profile.user_id == 99
 
-        # 再次获取返回同一个
         same = await service.get_or_create_profile(pg_session, user_id=99)
         assert same.id == profile.id
 
 
-class TestManualMemory:
-    """手动记忆 CRUD 测试。"""
+class TestDailyMemory:
+    """每日记忆测试（Mock MongoDB）。"""
 
     @pytest.mark.asyncio
-    async def test_create_memory(self, pg_session, service):
-        memory = await service.create_manual_memory(
-            pg_session,
-            user_id=1,
-            memory_data=ManualMemoryCreate(
-                content="每周五接女儿放学",
-                memory_type="event",
-                importance_score=8,
+    async def test_add_memory_items(self, service, mock_mongo_db):
+        items = [
+            MemoryItem(
+                category=MemoryCategory.PREFERENCE,
+                content="喜欢跑步",
+                importance=6,
             ),
-        )
-        await pg_session.commit()
+            MemoryItem(
+                category=MemoryCategory.HEALTH,
+                content="对花生过敏",
+                importance=9,
+            ),
+        ]
 
-        assert memory.content == "每周五接女儿放学"
-        assert memory.memory_type == "event"
-        assert memory.importance_score == 8
+        await service.add_memory_items(
+            user_id=1, date="2026-02-22", items=items, mongo_db=mock_mongo_db
+        )
+
+        mock_mongo_db.daily_memories.update_one.assert_called_once()
+        call_args = mock_mongo_db.daily_memories.update_one.call_args
+        assert call_args[0][0] == {"user_id": 1, "date": "2026-02-22"}
 
     @pytest.mark.asyncio
-    async def test_get_recent_memories(self, pg_session, service):
-        for i in range(5):
-            await service.create_manual_memory(
-                pg_session,
+    async def test_add_empty_items_is_noop(self, service, mock_mongo_db):
+        await service.add_memory_items(
+            user_id=1, date="2026-02-22", items=[], mongo_db=mock_mongo_db
+        )
+        mock_mongo_db.daily_memories.update_one.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_daily_memory_found(self, service, mock_mongo_db):
+        mock_mongo_db.daily_memories.find_one = AsyncMock(return_value={
+            "user_id": 1,
+            "date": "2026-02-22",
+            "items": [
+                {
+                    "category": "preference",
+                    "content": "喜欢跑步",
+                    "importance": 6,
+                    "source_role": "user",
+                    "extracted_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+            "summary": None,
+            "conversation_count": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        result = await service.get_daily_memory(1, "2026-02-22", mongo_db=mock_mongo_db)
+        assert result is not None
+        assert result.date == "2026-02-22"
+        assert len(result.items) == 1
+        assert result.items[0].content == "喜欢跑步"
+
+    @pytest.mark.asyncio
+    async def test_get_daily_memory_not_found(self, service, mock_mongo_db):
+        result = await service.get_daily_memory(1, "2026-02-22", mongo_db=mock_mongo_db)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_update_daily_summary(self, service, mock_mongo_db):
+        await service.update_daily_summary(
+            user_id=1,
+            date="2026-02-22",
+            summary="今天用户提到喜欢跑步和对花生过敏",
+            mongo_db=mock_mongo_db,
+        )
+        mock_mongo_db.daily_memories.update_one.assert_called_once()
+
+
+class TestLongTermMemory:
+    """长期记忆测试（Mock MongoDB）。"""
+
+    @pytest.mark.asyncio
+    async def test_create_long_term_memory(self, service, mock_mongo_db):
+        from app.models.memory import LongTermMemory
+
+        memory = LongTermMemory(
+            user_id=1,
+            period_type="weekly",
+            period_start="2026-02-10",
+            period_end="2026-02-16",
+            summary="本周用户重点关注健康和运动",
+            key_themes=["健康", "运动"],
+            notable_changes=["开始关注睡眠质量"],
+            emotional_trend="积极向上",
+        )
+        await service.create_long_term_memory(memory, mongo_db=mock_mongo_db)
+        mock_mongo_db.long_term_memories.insert_one.assert_called_once()
+
+
+class TestMemoryExtraction:
+    """记忆提取测试（Mock LLM API）。"""
+
+    @pytest.mark.asyncio
+    async def test_extract_and_store(self, service, mock_mongo_db):
+        mock_items = [
+            MemoryItem(
+                category=MemoryCategory.PREFERENCE,
+                content="喜欢跑步",
+                importance=6,
+            ),
+        ]
+
+        with patch.object(
+            service._extractor,
+            "extract_from_conversation",
+            return_value=mock_items,
+        ):
+            result = await service.extract_and_store(
                 user_id=1,
-                memory_data=ManualMemoryCreate(
-                    content=f"记忆 {i}",
-                    importance_score=i + 1,
-                ),
+                messages=[{"role": "user", "content": "我喜欢跑步"}],
+                mongo_db=mock_mongo_db,
             )
-        await pg_session.commit()
 
-        memories = await service.get_recent_memories(pg_session, user_id=1, limit=3)
-        assert len(memories) == 3
-        # 按重要性降序
-        assert memories[0].importance_score >= memories[1].importance_score
+        assert len(result) == 1
+        assert result[0].content == "喜欢跑步"
+        mock_mongo_db.daily_memories.update_one.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_delete_memory(self, pg_session, service):
-        memory = await service.create_manual_memory(
-            pg_session,
-            user_id=1,
-            memory_data=ManualMemoryCreate(content="要删除的记忆"),
+    async def test_extract_empty_messages(self, service, mock_mongo_db):
+        result = await service.extract_and_store(
+            user_id=1, messages=[], mongo_db=mock_mongo_db
         )
-        await pg_session.commit()
-
-        deleted = await service.delete_memory(pg_session, memory.id, user_id=1)
-        await pg_session.commit()
-        assert deleted is True
-
-        # 删除后不再出现在活跃记忆中
-        memories = await service.get_recent_memories(pg_session, user_id=1)
-        assert all(m.id != memory.id for m in memories)
-
-    @pytest.mark.asyncio
-    async def test_delete_nonexistent_returns_false(self, pg_session, service):
-        result = await service.delete_memory(pg_session, 99999, user_id=1)
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_cannot_delete_others_memory(self, pg_session, service):
-        memory = await service.create_manual_memory(
-            pg_session,
-            user_id=1,
-            memory_data=ManualMemoryCreate(content="用户1的记忆"),
-        )
-        await pg_session.commit()
-
-        # 用户2无法删除用户1的记忆
-        result = await service.delete_memory(pg_session, memory.id, user_id=2)
-        assert result is False
-
-
-class TestConversationContext:
-    """对话上下文测试。"""
-
-    @pytest.mark.asyncio
-    async def test_get_context_with_data(self, pg_session, service):
-        await service.create_user_profile(
-            pg_session,
-            UserProfileCreate(user_id=1, nickname="张伟", occupation="产品经理"),
-        )
-        await service.create_manual_memory(
-            pg_session,
-            user_id=1,
-            memory_data=ManualMemoryCreate(content="喜欢跑步"),
-        )
-        await pg_session.commit()
-
-        ctx = await service.get_conversation_context(pg_session, user_id=1)
-        assert ctx.core_profile is not None
-        assert ctx.core_profile.nickname == "张伟"
-        assert len(ctx.recent_memories) == 1
-        assert "张伟" in ctx.formatted_prompt
-        assert "喜欢跑步" in ctx.formatted_prompt
-
-    @pytest.mark.asyncio
-    async def test_get_context_empty_user(self, pg_session, service):
-        ctx = await service.get_conversation_context(pg_session, user_id=999)
-        assert ctx.core_profile is None
-        assert len(ctx.recent_memories) == 0
-        assert "暂无" in ctx.formatted_prompt
+        assert len(result) == 0

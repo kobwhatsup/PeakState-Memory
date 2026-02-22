@@ -1,4 +1,4 @@
-from app.services.instruction_parser import MemoryInstructionParser
+from app.services.memory_extractor import MemoryExtractor
 from app.services.memory_service import MemoryService
 
-__all__ = ["MemoryService", "MemoryInstructionParser"]
+__all__ = ["MemoryService", "MemoryExtractor"]
